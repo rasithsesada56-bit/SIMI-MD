@@ -7,10 +7,11 @@ import makeWASocket, {
 import { Boom } from "@hapi/boom";
 import P from "pino";
 import express from "express";
-import readline from "node:readline";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import readline from "node:readline";
+
 import config from "./config.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -19,16 +20,16 @@ const PLUGIN_DIR = path.join(__dirname, "plugins");
 
 const app = express();
 
-app.get("/", (req, res) => {
-  res.send("SIMI MD is running!");
+app.get("/", (_, res) => {
+  res.send("SIMI MD is running ❤️");
 });
 
-app.get("/health", (req, res) => {
-  res.json({ status: "running", bot: config.BOT_NAME });
+app.get("/health", (_, res) => {
+  res.json({ status: "online", bot: config.BOT_NAME });
 });
 
-app.listen(config.PORT, () => {
-  console.log(`${config.BOT_NAME} server running on ${config.PORT}`);
+app.listen(config.PORT, "0.0.0.0", () => {
+  console.log(`SIMI MD server started on ${config.PORT}`);
 });
 
 const logger = P({ level: "silent" });
@@ -42,15 +43,12 @@ async function loadPlugins() {
 
   for (const file of files) {
     try {
-      const filePath = pathToFileURL(
-        path.join(PLUGIN_DIR, file)
-      ).href;
-
-      const plugin = await import(filePath);
+      const url = pathToFileURL(path.join(PLUGIN_DIR, file));
+      const plugin = await import(url.href);
 
       if (plugin.default?.command && plugin.default?.run) {
         plugins.set(plugin.default.command, plugin.default);
-        console.log(`Loaded plugin: ${file}`);
+        console.log(`Loaded: ${file}`);
       }
     } catch (error) {
       console.error(`Plugin error ${file}:`, error.message);
@@ -58,26 +56,28 @@ async function loadPlugins() {
   }
 }
 
-function askPhoneNumber() {
+function askPhone() {
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout
   });
 
   return new Promise(resolve => {
-    rl.question("Enter WhatsApp number (947XXXXXXXX): ", answer => {
+    rl.question("Enter WhatsApp number with country code: ", number => {
       rl.close();
-      resolve(answer.trim().replace(/\D/g, ""));
+      resolve(number.replace(/\D/g, ""));
     });
   });
 }
 
-let reconnecting = false;
+let starting = false;
+let reconnectTimer;
 let reconnectDelay = 3000;
+let currentSocket;
 
 async function startBot() {
-  if (reconnecting) return;
-  reconnecting = true;
+  if (starting) return;
+  starting = true;
 
   try {
     fs.mkdirSync(AUTH_DIR, { recursive: true });
@@ -93,9 +93,36 @@ async function startBot() {
       syncFullHistory: false
     });
 
+    currentSocket = sock;
+
     sock.ev.on("creds.update", saveCreds);
 
-    sock.ev.on("connection.update", async update => {
+    await loadPlugins();
+
+    if (!state.creds.registered) {
+      let number = config.PHONE_NUMBER;
+
+      if (!number && process.stdin.isTTY) {
+        number = await askPhone();
+      }
+
+      if (!number || !/^\d{10,15}$/.test(number)) {
+        throw new Error(
+          "Set PHONE_NUMBER in Koyeb environment variables."
+        );
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
+      const code = await sock.requestPairingCode(number);
+
+      console.log("--------------------------------");
+      console.log("SIMI MD PAIRING CODE:", code);
+      console.log("Enter it in WhatsApp > Linked Devices");
+      console.log("--------------------------------");
+    }
+
+    sock.ev.on("connection.update", update => {
       const { connection, lastDisconnect } = update;
 
       if (connection === "connecting") {
@@ -104,49 +131,33 @@ async function startBot() {
 
       if (connection === "open") {
         reconnectDelay = 3000;
-        console.log("SIMI MD CONNECTED SUCCESSFULLY!");
-        console.log("OWNER: " + config.OWNER_NAME);
+        console.log("SIMI MD CONNECTED ❤️");
+        console.log("OWNER:", config.OWNER_NAME);
       }
 
       if (connection === "close") {
         const status = new Boom(
           lastDisconnect?.error
-        ).output?.statusCode;
+        ).output.statusCode;
+
+        console.log("Connection closed:", status);
+
+        starting = false;
 
         if (status === DisconnectReason.loggedOut) {
-          console.log("WhatsApp logged out. Fresh pairing required.");
-          reconnecting = false;
+          console.log("Logged out. New pairing is required.");
           return;
         }
 
-        console.log("Connection closed. Reconnecting...");
-        reconnecting = false;
+        if (reconnectTimer) clearTimeout(reconnectTimer);
 
-        setTimeout(() => {
+        reconnectTimer = setTimeout(() => {
           startBot().catch(console.error);
         }, reconnectDelay);
 
         reconnectDelay = Math.min(reconnectDelay * 2, 60000);
       }
     });
-
-    if (!state.creds.registered) {
-      const number = await askPhoneNumber();
-
-      if (!/^\d{10,15}$/.test(number)) {
-        throw new Error("Invalid phone number.");
-      }
-
-      await new Promise(resolve => setTimeout(resolve, 1500));
-
-      const code = await sock.requestPairingCode(number);
-
-      console.log("\n================================");
-      console.log("SIMI MD PAIRING CODE:", code);
-      console.log("================================");
-      console.log("Open WhatsApp > Linked Devices");
-      console.log("Choose Link with phone number.");
-    }
 
     sock.ev.on("messages.upsert", async ({ messages, type }) => {
       if (type !== "notify") return;
@@ -156,57 +167,64 @@ async function startBot() {
           if (!msg.message || msg.key.fromMe) continue;
 
           const jid = msg.key.remoteJid;
+
           if (!jid || jid === "status@broadcast") continue;
 
-          const text =
+          const body =
             msg.message.conversation ||
             msg.message.extendedTextMessage?.text ||
             msg.message.imageMessage?.caption ||
             msg.message.videoMessage?.caption ||
             "";
 
-          if (!text.startsWith(config.PREFIX)) continue;
+          if (!body.startsWith(config.PREFIX)) continue;
 
-          const args = text.slice(config.PREFIX.length)
+          const parts = body.slice(config.PREFIX.length)
             .trim().split(/\s+/);
 
-          const command = args.shift()?.toLowerCase();
-          const query = args.join(" ");
+          const command = parts.shift()?.toLowerCase();
+          const query = parts.join(" ");
 
           const plugin = plugins.get(command);
-
           if (!plugin) continue;
 
           await plugin.run({
             sock,
             msg,
             jid,
-            args,
+            args: parts,
             query,
             config
           });
 
         } catch (error) {
-          console.error("Command error:", error);
+          console.error("Message error:", error);
         }
       }
     });
 
-    await loadPlugins();
-
   } catch (error) {
-    console.error("Bot startup error:", error);
-    reconnecting = false;
+    console.error("Startup error:", error);
+    starting = false;
 
-    setTimeout(() => {
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+
+    reconnectTimer = setTimeout(() => {
       startBot().catch(console.error);
     }, reconnectDelay);
 
     reconnectDelay = Math.min(reconnectDelay * 2, 60000);
-    return;
   }
-
-  reconnecting = false;
 }
 
+process.on("SIGTERM", async () => {
+  console.log("SIMI MD shutting down...");
+  try {
+    currentSocket?.end(undefined);
+  } catch {}
+  process.exit(0);
+});
+
 startBot().catch(console.error);
+
+
